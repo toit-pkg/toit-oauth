@@ -99,12 +99,13 @@ class DeviceOAuth_ extends OAuth:
           // the token is valid.
           break
 
-        if error-code:
-          throw (AuthException
-              --status-code=response.status-code
-              --status-message=response.status-message
-              --error-code=error-code
-              --error-description=decoded.get "error_description")
+        // Anything else (unexpected error code, non-2xx status, unparseable
+        // body) is unrecoverable — surface it instead of silently looping.
+        throw (AuthException
+            --status-code=response.status-code
+            --status-message=response.status-message
+            --error-code=error-code
+            --error-description=decoded.get "error_description")
 
       // TODO(florian): is this a good error?
       throw DEADLINE-EXCEEDED-ERROR
