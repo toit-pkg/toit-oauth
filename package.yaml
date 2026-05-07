@@ -1,5 +1,5 @@
-name: auth
-description:
+name: oauth
+description: OAuth 2.0 authentication client supporting localhost code flow and device flow.
 dependencies:
   host:
     url: github.com/toitlang/pkg-host
