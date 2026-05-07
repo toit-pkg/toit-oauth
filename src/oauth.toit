@@ -1,0 +1,634 @@
+// Copyright (C) 2023 Toitware ApS.
+// Use of this source code is governed by an MIT-style license that can be
+// found in the LICENSE file.
+
+import encoding.url
+import encoding.json
+import http
+import log
+import monitor
+import net
+import net.tcp
+
+import .auth
+import .token
+import .utils_
+
+class AuthException:
+  status-code/int?
+  status-message/string?
+  error-code/string?
+  error-description/string?
+
+  constructor
+      --.status-code=null
+      --.status-message=null
+      --.error-code=null
+      --.error-description=null:
+
+  /**
+  Error descriptions for OAuth 2.0 errors.
+
+  See https://datatracker.ietf.org/doc/html/rfc6749#section-4.1.2.1.
+
+  Also contains error descriptions for errors that are not part of the
+    OAuth 2.0 specification, but are used by this library.
+  */
+  static ERROR-DESCRIPTIONS ::= {
+    "invalid_request": """
+      The request is missing a required parameter, includes an invalid \
+      parameter value, includes a parameter more than once, or is otherwise \
+      malformed.""",
+    "unauthorized_client": """
+      The client is not authorized to request an access token using this \
+      method.""",
+    "access_denied": """
+      The resource owner or authorization server denied the request.""",
+    "unsupported_response_type": """
+      The authorization server does not support obtaining an access token \
+      using this method.""",
+    "invalid_scope": """
+      The requested scope is invalid, unknown, or malformed.""",
+    "server_error": """
+      The authorization server encountered an unexpected condition that \
+      prevented it from fulfilling the request.""",
+    "temporarily_unavailable": """
+      The authorization server is currently unable to handle the request \
+      due to a temporary overloading or maintenance of the server.""",
+    "missing_code": """
+      The authorization server did not return an authorization code in the \
+      response.""",
+    "missing_access_token": """
+      The token server did not return an access token in the response.""",
+  }
+
+  /**
+  Converts a one-word error string to a human-readable error string.
+  */
+  static error-to-human error/string -> string:
+    return ERROR-DESCRIPTIONS.get error --if-absent=: error
+
+  stringify -> string:
+    if error-code:
+      return "$error-code: $error-description"
+    if status-code:
+      return "HTTP $status-code $status-message"
+    return "Unknown error"
+
+parse-token-response_ response/http.Response -> Token:
+  decoded/Map := {:}
+  exception := catch:
+    decoded = json.decode-stream response.body
+
+  if exception:
+    throw (AuthException
+        --error-code="parse_error"
+        --error-description="Failed to parse token response: $exception")
+
+  if response.status-code != 200:
+    throw (AuthException
+        --status-code=response.status-code
+        --status-message=response.status-message
+        --error-code=decoded.get "error"
+        --error-description=decoded.get "error_description")
+
+  return parse-token-json_ decoded
+
+parse-token-json_ decoded/Map -> Token:
+  access-token := decoded.get "access_token"
+  token-type := decoded.get "token_type"
+  expires-in := decoded.get "expires_in"
+  refresh-token := decoded.get "refresh_token"
+  scope := decoded.get "scope"
+  returned-scopes := scope and (scope.split " ")
+
+  if not access-token:
+    throw (AuthException
+        --error-code="missing_access_token"
+        --error-description="The access token is missing")
+
+  return Token
+      --access-token=access-token
+      --token-type=token-type
+      --expires-in-s=expires-in
+      --refresh-token=refresh-token
+      --scopes=returned-scopes
+
+/**
+An OAuth client that uses a token endpoint to authenticate.
+*/
+abstract class OAuth extends TokenAuthProvider:
+  token-url_/string
+  client-id_/string
+  client-secret_/string?
+
+  scopes_/List
+
+  constructor.from-sub_
+      --client-id
+      --client-secret
+      --token-url
+      --scopes
+      --root-certificates/List
+      --local-storage/LocalStorage:
+    client-id_ = client-id
+    client-secret_ = client-secret
+    token-url_ = token-url
+    scopes_ = scopes
+    super --root-certificates=root-certificates --local-storage=local-storage
+
+  /**
+  Constructs an OAuth provider that uses a code flow redirecting to localhost.
+
+  When doing the authentication ($ensure-authenticated), this instance will
+    start a local http server that listens for a redirect from the OAuth provider.
+
+  The $localhost parameter must be "localhost" or "127.0.0.1".
+  The $redirect-path parameter is the path that the authenticated user should be
+    redirected to. Typically, the OAuth provider has a list of valid redirect
+    URLs (including the paths), and the combined URI ($localhost + $redirect-path)
+    must be one of them. Most OAuth providers allow to change the port of a localhost
+    redirect URL, but not the host name or the path.
+
+  The $client-id is provided by the OAuth provider and identifies the application.
+  The $client-secret is generated by the OAuth provider. Depending on the OAuth
+    provider, the secret is confidential or not. For example, GitHub warns
+    that the client secret should be kept secret and not even be checked
+    in. They recommend to use a device flow if the client
+    secret can't be kept confidential). Google, on the other hand,
+    explicitly states that the client secret is not really a secret
+    when the authentication is for an installed application.
+
+  The $logger parameter is used for the http server that is started to listen
+    for the redirect.
+
+  The $endpoint parameter is the URL where the OAuth provider is located.
+    It is provided by the OAuth provider. For example, Google publishes
+    the endpoint URL in their
+    [discover document](https://accounts.google.com/.well-known/openid-configuration),
+    under 'authorization_endpoint'.
+
+  The $token-url parameter is the URL where the OAuth provider can be
+    queried for an access token. It is provided by the OAuth provider.
+    For example, Google publishes the token URL in their
+    [discover document](https://accounts.google.com/.well-known/openid-configuration),
+    under 'token_endpoint'.
+
+  If the OAuth provider is accessed through "https", then the $root-certificates
+    parameter must contain the root certificates needed to access the OAuth
+    provider. If the OAuth provider is accessed through "http", then the
+    $root-certificates parameter can be empty.
+
+  The $scopes list identify the resources that the application wants to
+    access. For example, Google has URLs like
+    "https://www.googleapis.com/auth/userinfo.email" or "https://www.googleapis.com/auth/drive".
+    GitHub has "repo", "repo:status", "user", "read:user", "gist", etc.
+
+  The $query-parameters parameter is a map of additional query parameters that
+    are passed to the redirect URL. For example, Google allows to pass a
+    "login_hint" parameter to the redirect URL to pre-fill the email address
+    of the user.
+
+  The $local-storage parameter is used to store the token, so it can be
+    reused after the application is restarted.
+  */
+  constructor.localhost
+      --localhost/string="localhost"
+      --redirect-path/string
+      --client-id/string
+      --client-secret/string?
+      --logger/log.Logger=(log.default.with-level log.FATAL-LEVEL)
+      --endpoint/string
+      --token-url/string
+      --root-certificates/List
+      --scopes/List
+      --query-parameters/Map={:}
+      --local-storage/LocalStorage:
+    if localhost != "localhost" and localhost != "127.0.0.1":
+      throw "localhost must be 'localhost' or '127.0.0.1'"
+
+    return LocalhostCodeOAuth_
+        --localhost=localhost
+        --redirect-path=redirect-path
+        --logger=logger
+        --endpoint=endpoint
+        --client-id=client-id
+        --client-secret=client-secret
+        --scopes=scopes
+        --token-url=token-url
+        --root-certificates=root-certificates
+        --query-parameters=query-parameters
+        --local-storage=local-storage
+
+  /**
+  Constructs an OAuth provider that uses a device flow.
+
+  When doing the authentication ($ensure-authenticated), this instance will
+    start a device flow.
+
+  The device flow is typically used for embedded devices that don't have
+    a browser. Users open the authorization URI in a browser
+    on a different device, and then enter the code that is displayed on
+    the embedded device. The device flow is also known as "device
+    authorization grant".
+
+  The $client-id identifies the application. It is generated by the OAuth
+    provider, and used to verify that the redirect_uri is registered for
+    the client_id.
+
+  The $endpoint-url and $token-url URIs are provided by the OAuth provider.
+    For example, Google publishes the endpoint URL in their
+    [discover document](https://accounts.google.com/.well-known/openid-configuration),
+    under 'device_authorization_endpoint' and 'token_endpoint'.
+
+  The $scopes identify the resources that the application wants to
+    access. For example, Google has
+    "https://www.googleapis.com/auth/userinfo.email" or
+    "https://www.googleapis.com/auth/drive". GitHub has
+    "repo", "repo:status", "user", "gist", etc.
+  */
+  constructor.device
+      --client-id/string
+      --endpoint-url/string
+      --token-url/string
+      --root-certificates/List
+      --scopes/List
+      --local-storage/LocalStorage:
+    return DeviceOAuth_
+        --client-id=client-id
+        --endpoint-url=endpoint-url
+        --token-url=token-url
+        --root-certificates=root-certificates
+        --scopes=scopes
+        --local-storage=local-storage
+
+  refresh --network/net.Client?=null token/Token -> Token:
+    if not token.refresh-token:
+      throw "No refresh token available."
+    with-http-client network --root-certificates=root-certificates_: | client/http.Client |
+      response := client.post-json --uri=token-url_ {
+        "client_id": client-id_,
+        // When using the device flow, some providers don't want the client to have
+        // a client secret. However, in those cases we tend to not have a refresh
+        // token either. So if the client secret is null we shouldn't reach this line.
+        // If there is a provider that has a refresh token and no client secret, we
+        // just send null here.
+        "client_secret": client-secret_,
+        "refresh_token": token.refresh-token,
+        "grant_type": "refresh_token",
+      }
+      return parse-token-response_ response
+    unreachable
+
+  abstract do-authentication_ --network/net.Client?=null [block] -> Token
+
+class DeviceOAuth_ extends OAuth:
+  endpoint-url_/string
+
+  /** See $OAuth.device. */
+  constructor
+      --client-id/string
+      --endpoint-url/string
+      --token-url/string
+      --root-certificates/List
+      --scopes/List
+      --local-storage/LocalStorage:
+    endpoint-url_ = endpoint-url
+    super.from-sub_
+        --client-id=client-id
+        --client-secret=null
+        --token-url=token-url
+        --scopes=scopes
+        --root-certificates=root-certificates
+        --local-storage=local-storage
+
+  do-authentication_ --network/net.Client?=null [block] -> Token:
+    with-http-client network --root-certificates=root-certificates_: | client/http.Client |
+      headers := http.Headers
+      headers.add "Accept" "application/json"
+      response := client.post-form --uri=endpoint-url_ --headers=headers {
+        "client_id": client-id_,
+        "scope": scopes_.join " ",
+      }
+      decoded/Map := {:}
+      exception := catch:
+        decoded = json.decode-stream response.body
+      if response.status-code != 200 or exception:
+        throw (AuthException
+            --status-code=response.status-code
+            --status-message=response.status-message
+            --error-code=decoded.get "error"
+            --error-description=decoded.get "error_description")
+
+      device-code := decoded["device_code"]
+      user-code := decoded["user_code"]
+      verification-uri := decoded["verification_uri"]
+      expires-in-s :=decoded["expires_in"]
+      interval-s := decoded["interval"]
+
+      block.call verification-uri user-code
+
+      expires-time := Time.now + (Duration --s=expires-in-s)
+      while Time.now < expires-time:
+        sleep --ms=(1000 * interval-s)
+
+        // Check if the user has authorized the application.
+        response = client.post-json --uri=token-url_ --headers=headers {
+          "client_id": client-id_,
+          "device_code": device-code,
+          "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+        }
+
+        decoded = {:}
+        exception = catch:
+          decoded = json.decode-stream response.body
+
+        if decoded.contains "access_token":
+          return parse-token-json_ decoded
+
+        error-code := decoded.get "error"
+
+        if error-code == "authorization_pending":
+          // Still waiting for the user to authorize the application.
+          continue
+
+        if error-code == "slow_down":
+          // We have to wait longer between intervals.
+          if decoded.contains "interval":
+            interval-s = decoded["interval"]
+          else:
+            interval-s += 5
+          continue
+
+        if error-code == "expired_token":
+          // Shouldn't really happen since we only poll as long as
+          // the token is valid.
+          break
+
+        if error-code:
+          throw (AuthException
+              --status-code=response.status-code
+              --status-message=response.status-message
+              --error-code=error-code
+              --error-description=decoded.get "error_description")
+
+      // TODO(florian): is this a good error?
+      throw DEADLINE-EXCEEDED-ERROR
+    unreachable
+
+/**
+An OAuth authorization code flow.
+*/
+class LocalhostCodeOAuth_ extends OAuth:
+  localhost_/string
+  redirect-path_/string
+  logger_/log.Logger
+  endpoint_/string
+  query-parameters_/Map
+
+  /**
+  See $OAuth.localhost.
+  */
+  constructor
+      --localhost/string="localhost"
+      --redirect-path/string
+      --logger/log.Logger=(log.default.with-level log.FATAL-LEVEL)
+      --endpoint/string
+      --client-id/string
+      --client-secret/string
+      --scopes/List
+      --token-url/string
+      --root-certificates/List
+      --query-parameters/Map={:}
+      --local-storage/LocalStorage:
+    localhost_ = localhost
+    redirect-path_ = redirect-path
+    logger_ = logger
+    endpoint_ = endpoint
+    query-parameters_ = query-parameters
+
+    super.from-sub_
+        --client-id=client-id
+        --client-secret=client-secret
+        --token-url=token-url
+        --scopes=scopes
+        --root-certificates=root-certificates
+        --local-storage=local-storage
+
+  do-authentication_ --network/net.Client?=null [block] -> Token:
+    network-needs-close := false
+    if not network:
+      network = net.open
+      network-needs-close = true
+
+    server-socket/tcp.ServerSocket? := null
+
+    try:
+      server-socket = network.tcp-listen 0
+      server := http.Server --logger=logger_
+      port := server-socket.local-address.port
+
+      redirect-url := "http://$localhost_:$port$redirect-path_"
+
+      code-flow := OAuthCodeFlow
+          --client-id=client-id_
+          --client-secret=client-secret_
+          --token-url=token-url_
+          --root-certificates=root-certificates_
+          --endpoint=endpoint_
+          --redirect-url=redirect-url
+          --query-parameters=query-parameters_
+
+      authenticate-url := code-flow.get-url --scopes=scopes_
+      block.call authenticate-url null
+
+      session-latch := monitor.Latch
+      server-task := task::
+        server.listen server-socket:: | request/http.Request writer/http.ResponseWriter |
+          if request.path.starts-with redirect-path_ and request.path.contains "?":
+            // TODO(florian): extract error if there is one:
+            // ```
+            // http://localhost:41055/auth?error=server_error&error_description=Database+error+saving+new+user
+            // ```
+            token := code-flow.get-token request.path --network=network
+            writer.out.write "You can close this window now."
+            session-latch.set token
+          else if request.path.starts-with redirect-path_:
+            // No query parameters.
+            // The information might be in the fragment (hash) data.
+            // Send a web-page that changes the fragment to a query string.
+            writer.out.write """
+            <html>
+              <body>
+                <p id="body">
+                This page requires JavaScript to continue.
+                </p>
+                <script type="text/javascript">
+                  const req = new XMLHttpRequest();
+                  req.addEventListener("load", function() {
+                    document.getElementById("body").innerHTML = "You can close this window now.";
+                  });
+                  req.open("GET", "http://localhost:$port/$redirect-path_?" window.location.hash.substring(1));
+                  req.send();
+                  document.getElementById("body").innerHTML = "Transmitting data to CLI...";
+                </script>
+              </body>
+            </html>
+            """
+          else:
+            writer.out.write "Invalid request."
+
+      result := session-latch.get
+      sleep --ms=1  // Give the server time to respond with the success message.
+      server-task.cancel
+      return result
+    finally:
+      if server-socket:
+        server-socket.close
+      if network-needs-close:
+        network.close
+
+/**
+An OAuth authorization code flow.
+
+This flow is used by applications that can open a browser window to
+  authenticate the user. The application then receives an authorization code
+  that can be exchanged for an access token.
+
+Steps:
+- The code flow provides a URL that the user can open in a browser.
+- The user authenticates and authorizes the application.
+- The user is redirected to a URL that the application has specified.
+- The application extracts the authorization code from the URL.
+- The application exchanges the authorization code for an access token.
+
+Depending on the OAuth provider this flow is recommended for installed applications
+  or not. For example, Google recommends to use this flow for installed applications.
+  GitHub recommends to use the device flow for installed applications instead.
+*/
+class OAuthCodeFlow:
+  /**
+  The client ID.
+
+  The ID is provided by the OAuth provider and identifies the application.
+  */
+  client-id/string
+
+  /**
+  The client secret.
+
+  The secret is generated by the OAuth provider. Depending on the OAuth
+    provider, the secret is confidential or not. For example, GitHub warns
+    that the client secret should be kept secret and not even be checked
+    in. They recommend to use a device flow if the client
+    secret can't be kept confidential). Google, on the other hand,
+    explicitly states that the client secret is not really a secret
+    when the authentication is for an installed application.
+  */
+  client-secret/string
+
+  /**
+  The base URI of the authorization endpoint.
+
+  It is provided by the OAuth provider. For example, Google publishes
+    the endpoint URL in their
+    [discover document](https://accounts.google.com/.well-known/openid-configuration),
+    under 'authorization_endpoint'.
+  */
+  endpoint/string
+
+  /**
+  The URL where the user is redirected after logging in.
+
+  The authentication provider requires the redirect URL to be registered
+    beforehand. The user of this flow must have a server that listens on
+    this URL. The server must call $get-token with the parameters provided
+    in the redirect.
+  */
+  redirect-url/string
+
+  /**
+  The URL where the library can obtain the token.
+  */
+  token-url/string
+
+  /**
+  The root certificates needed to access $token-url.
+  */
+  root-certificates/List
+
+  /**
+  Additional query parameters that are passed to the redirect URL.
+  */
+  query-parameters/Map
+
+  constructor
+      --.endpoint
+      --.client-id
+      --.client-secret
+      --.token-url
+      --.redirect-url
+      --.root-certificates
+      --.query-parameters={:}:
+
+  /**
+  Returns the URL where the user can log in.
+
+  The $scopes list identify the resources that the application wants to
+    access. For example, Google has URLs like
+    "https://www.googleapis.com/auth/userinfo.email" or "https://www.googleapis.com/auth/drive".
+    GitHub has "repo", "repo:status", "user", "read:user", "gist", etc.
+
+  If provided, then the $state is passed to the redirect URL. It is an arbitrary
+    string and typically used to prevent CSRF attacks. On GitHub it is supposed to
+    be an unguessable random string, to protect against cross-site request forgery
+    attacks. Google suggest additional uses, such as directing the user to the correct
+    resource, sending nonces, etc. The $state is always sent verbatim to
+    the $redirect-url. Note that this instance does *not* verify that the returned
+    state matches the provided state. The caller of $get-token must do that.
+  */
+  get-url --scopes/List state/string?=null -> string:
+    parameters := query-parameters.copy
+    parameters["client_id"] = client-id
+    parameters["redirect_uri"] = redirect-url
+    parameters["scope"] = scopes.join " "
+    parameters["response_type"] = "code"
+    if state: parameters["state"] = state
+
+    return "$endpoint?$(build-url-encoded-query-parameters parameters)"
+
+  /**
+  Returns an authorization token.
+
+  The $response-url is the URL (including the query parameters) that the server
+    received in the redirect URL.
+
+  The $network is used to obtain the token. If $network is null, then a new
+    network is created and closed after the token is obtained.
+  */
+  get-token response-url/string --network/net.Client?=null -> Token:
+    parsed := url.QueryString.parse response-url
+
+    code := parsed.parameters.get "code"
+    if not code:
+      exception := AuthException
+          --error-code="missing_code"
+          --error-description="The code is missing"
+      throw exception
+
+    with-http-client network --root-certificates=root-certificates: | client/http.Client |
+      parameters := {
+        "code": code,
+        "client_id": client-id,
+        "client_secret": client-secret,
+        "redirect_uri": redirect-url,
+        "grant_type": "authorization_code",
+      }
+      encoded-params := build-url-encoded-query-parameters parameters
+      headers := http.Headers
+      headers.add "Accept" "application/json"
+      url-with-code := "$token-url?$encoded-params"
+      response := client.get --uri=url-with-code --headers=headers
+      return parse-token-response_ response
+
+    unreachable
