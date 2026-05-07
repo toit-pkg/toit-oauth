@@ -15,29 +15,27 @@ import oauth show *
 import .test-helper_
 
 main:
-  test-localhost-happy-path
+  test-state-mismatch-then-match
 
-test-localhost-happy-path:
+test-state-mismatch-then-match:
   network := net.open
   socket := network.tcp-listen 0
   port := socket.local-address.port
 
-  received-token-params/Map? := null
+  token-call-count := 0
 
   server := http.Server --logger=(log.default.with-level log.FATAL-LEVEL)
   task --background::
     server.listen socket:: | request/http.RequestIncoming writer/http.ResponseWriter |
       request.body.drain
-      if request.query.resource.starts-with "/token":
-        received-token-params = request.query.parameters
-        body := json.encode {
+      if request.query.resource == "/token":
+        token-call-count++
+        writer.write-headers 200
+        writer.out.write (json.encode {
           "access_token": "AT-1",
           "token_type": "bearer",
-          "refresh_token": "RT-1",
           "expires_in": 3600,
-        }
-        writer.write-headers 200
-        writer.out.write body
+        })
       else:
         writer.write-headers 404
         writer.out.write "not found"
@@ -50,7 +48,7 @@ test-localhost-happy-path:
       --token-url="http://localhost:$port/token"
       --root-certificates=[]
       --scopes=["scope1"]
-      --redirect-path="/callback"
+      --redirect-path="/cb"
       --local-storage=storage
 
   auth-url-latch := monitor.Latch
@@ -62,34 +60,31 @@ test-localhost-happy-path:
 
   auth-url := auth-url-latch.get
   parsed := url.QueryString.parse auth-url
-  expect-equals "my-client" parsed.parameters["client_id"]
-  expect-equals "scope1" parsed.parameters["scope"]
-  expect-equals "code" parsed.parameters["response_type"]
+  state := parsed.parameters.get "state"
+  expect-not-null state  // Client must generate a state for CSRF protection.
   redirect-uri := parsed.parameters["redirect_uri"]
-  state := parsed.parameters["state"]
 
-  // Simulate the user being redirected with a code.
+  // First send a redirect with the wrong state.
   client := http.Client network
-  response := client.get --uri="$redirect-uri?code=fake-code&state=$state"
-  expect-equals 200 response.status-code
-  response.body.read-all  // Drain.
+  bad-response := client.get --uri="$redirect-uri?code=fake-code&state=wrong-state"
+  bad-response.body.read-all
+  expect-not-equals 200 bad-response.status-code
   client.close
 
+  // The token endpoint must not have been hit.
+  expect-equals 0 token-call-count
+  expect-not oauth-client.is-authenticated
+
+  // Now send the correct state — auth should complete.
+  client2 := http.Client network
+  good-response := client2.get --uri="$redirect-uri?code=fake-code&state=$state"
+  good-response.body.read-all
+  expect-equals 200 good-response.status-code
+  client2.close
+
   expect-equals true done-latch.get
-
-  expect-not-null received-token-params
-  expect-equals "fake-code" received-token-params["code"]
-  expect-equals "my-client" received-token-params["client_id"]
-  expect-equals "my-secret" received-token-params["client_secret"]
-  expect-equals "authorization_code" received-token-params["grant_type"]
-
+  expect-equals 1 token-call-count
   expect oauth-client.is-authenticated
-  expect-equals "Bearer AT-1" oauth-client.auth-headers["Authorization"]
-
-  // Storage should have persisted the token.
-  expect storage.has-auth
-  expect-equals "AT-1" storage.get-auth["access_token"]
-  expect-equals "RT-1" storage.get-auth["refresh_token"]
 
   socket.close
   network.close

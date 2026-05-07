@@ -2,7 +2,10 @@
 // Use of this source code is governed by an MIT-style license that can be
 // found in the LICENSE file.
 
+import crypto
+import encoding.hex
 import encoding.json
+import encoding.url
 import http
 import log
 import monitor
@@ -170,7 +173,9 @@ class LocalhostCodeOAuth_ extends OAuth:
           --redirect-url=redirect-url
           --query-parameters=query-parameters_
 
-      authenticate-url := code-flow.get-url --scopes=scopes_
+      // Generate a random state string for CSRF protection.
+      state := hex.encode (crypto.random --size=16)
+      authenticate-url := code-flow.get-url --scopes=scopes_ state
       block.call authenticate-url null
 
       session-latch := monitor.Latch
@@ -181,9 +186,14 @@ class LocalhostCodeOAuth_ extends OAuth:
             // ```
             // http://localhost:41055/auth?error=server_error&error_description=Database+error+saving+new+user
             // ```
-            token := code-flow.get-token request.path --network=network
-            writer.out.write "You can close this window now."
-            session-latch.set token
+            received-state := (url.QueryString.parse request.path).parameters.get "state"
+            if received-state != state:
+              writer.write-headers 400
+              writer.out.write "Invalid state parameter."
+            else:
+              token := code-flow.get-token request.path --network=network
+              writer.out.write "You can close this window now."
+              session-latch.set token
           else if request.path.starts-with redirect-path_:
             // No query parameters.
             // The information might be in the fragment (hash) data.
