@@ -383,7 +383,15 @@ abstract class OAuth extends TokenAuthProvider:
         "refresh_token": token.refresh-token,
         "grant_type": "refresh_token",
       }
-      return parse-token-response_ response
+      new-token := parse-token-response_ response
+      if not new-token.refresh-token:
+        // Some providers (e.g. Google) only issue a refresh token on the very
+        // first exchange and omit it from subsequent refresh responses. Carry
+        // the previous one forward so future refreshes still work.
+        json := new-token.to-json
+        json["refresh_token"] = token.refresh-token
+        new-token = Token.from-json json
+      return new-token
     unreachable
 
   abstract do-authentication_ --network/net.Client?=null [block] -> Token
