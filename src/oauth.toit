@@ -568,19 +568,15 @@ open-browser url/string -> none:
     // If we have a supported platform try to open the URL.
     // For all other platforms don't do anything.
     if command != null:
-      fork-data := pipe.fork
-          true  // Use path.
-          pipe.PIPE-CREATED  // Stdin.
-          pipe.PIPE-CREATED  // Stdout.
-          pipe.PIPE-CREATED  // Stderr.
-          command
-          [ command ] + args
-      pid := fork-data[3]
+      process := pipe.fork command [ command ] + args
+          --create-stdin
+          --create-stdout
+          --create-stderr
       task --background::
         // The 'open' command should finish in almost no time.
         // If it takes more than 20 seconds, kill it.
         exception := catch: with-timeout --ms=20_000:
-          pipe.wait-for pid
+          process.wait
         if exception == DEADLINE-EXCEEDED-ERROR:
           SIGKILL ::= 9
-          catch: pipe.kill_ pid SIGKILL
+          catch: pipe.kill_ process.pid SIGKILL
