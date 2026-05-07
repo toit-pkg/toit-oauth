@@ -1,0 +1,11 @@
+name: oauth-tests
+description: End-to-end tests for the oauth package.
+dependencies:
+  oauth:
+    path: ..
+  host:
+    url: github.com/toitlang/pkg-host
+    version: ^1.15.3
+  http:
+    url: github.com/toitlang/pkg-http
+    version: ^2.8.0
