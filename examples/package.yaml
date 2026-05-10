@@ -1,10 +1,12 @@
-name: oauth
-description: OAuth 2.0 authentication client supporting localhost code flow and device
-  flow.
 dependencies:
+  certificate-roots:
+    url: github.com/toitware/toit-cert-roots
+    version: ^1.11.0
   host:
     url: github.com/toitlang/pkg-host
     version: ^1.17.0
   http:
     url: github.com/toitlang/pkg-http
     version: ^2.12.0
+  oauth:
+    path: ..
