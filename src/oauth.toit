@@ -7,8 +7,6 @@ import encoding.json
 import http
 import log
 import net
-import system
-import host.pipe
 
 import .flows_
 import .token
@@ -543,40 +541,3 @@ class OAuthCodeFlow:
       return parse-token-response_ response
 
     unreachable
-
-/**
-Opens the default browser with the given URL.
-
-Only works on Linux, macOS and Windows.
-If launching the browser fails, no error is reported.
-*/
-open-browser url/string -> none:
-  platform := system.platform
-  catch:
-    command/string? := null
-    args/List? := null
-    if platform == system.PLATFORM-LINUX:
-      command = "xdg-open"
-      args = [ url ]
-    else if platform == system.PLATFORM-MACOS:
-      command = "open"
-      args = [ url ]
-    else if platform == system.PLATFORM-WINDOWS:
-      command = "cmd"
-      escaped-url := url.replace "&" "^&"
-      args = [ "/c", "start", escaped-url ]
-    // If we have a supported platform try to open the URL.
-    // For all other platforms don't do anything.
-    if command != null:
-      process := pipe.fork command [ command ] + args
-          --create-stdin
-          --create-stdout
-          --create-stderr
-      task --background::
-        // The 'open' command should finish in almost no time.
-        // If it takes more than 20 seconds, kill it.
-        exception := catch: with-timeout --ms=20_000:
-          process.wait
-        if exception == DEADLINE-EXCEEDED-ERROR:
-          SIGKILL ::= 9
-          catch: pipe.kill_ process.pid SIGKILL
