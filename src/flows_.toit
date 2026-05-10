@@ -210,7 +210,7 @@ class LocalhostCodeOAuth_ extends OAuth:
                   req.addEventListener("load", function() {
                     document.getElementById("body").innerHTML = "You can close this window now.";
                   });
-                  req.open("GET", "http://localhost:$port/$redirect-path_?" window.location.hash.substring(1));
+                  req.open("GET", "http://localhost:$port$redirect-path_?" + window.location.hash.substring(1));
                   req.send();
                   document.getElementById("body").innerHTML = "Transmitting data to CLI...";
                 </script>
