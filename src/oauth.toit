@@ -184,17 +184,20 @@ parse-token-response_ response/http.Response -> Token:
   exception := catch:
     decoded = json.decode-stream response.body
 
-  if exception:
-    throw (AuthException
-        --error-code="parse_error"
-        --error-description="Failed to parse token response: $exception")
-
+  // Surface HTTP errors before parse errors: a non-2xx status with a non-JSON
+  // body (e.g. an HTML error page from an upstream proxy) is more informative
+  // as "HTTP 503" than as "parse_error".
   if response.status-code != 200:
     throw (AuthException
         --status-code=response.status-code
         --status-message=response.status-message
         --error-code=decoded.get "error"
         --error-description=decoded.get "error_description")
+
+  if exception:
+    throw (AuthException
+        --error-code="parse_error"
+        --error-description="Failed to parse token response: $exception")
 
   return parse-token-json_ decoded
 
