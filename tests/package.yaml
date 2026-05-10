@@ -1,7 +1,8 @@
-name: oauth
-description: OAuth 2.0 authentication client supporting localhost code flow and device
-  flow.
+name: oauth-tests
+description: End-to-end tests for the oauth package.
 dependencies:
+  oauth:
+    path: ..
   host:
     url: github.com/toitlang/pkg-host
     version: ^1.15.3
